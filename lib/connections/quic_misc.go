@@ -26,6 +26,21 @@ var quicConfig = &quic.Config{
 	KeepAlivePeriod: 15 * time.Second,
 }
 
+func quicConfigForMode(wechatMasking bool) *quic.Config {
+	if !wechatMasking {
+		return quicConfig
+	}
+
+	// Keep the ordinary configuration untouched. The additional 13-byte
+	// envelope is accounted for conservatively by disabling PMTU discovery
+	// and using the QUIC minimum Initial size; paths must still carry the
+	// resulting 1213-byte UDP payload plus outer protocol headers.
+	masked := *quicConfig
+	masked.InitialPacketSize = 1200
+	masked.DisablePathMTUDiscovery = true
+	return &masked
+}
+
 func quicNetwork(uri *url.URL) string {
 	switch uri.Scheme {
 	case "quic4":

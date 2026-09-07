@@ -17,7 +17,6 @@ import (
 	"net/url"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/quic-go/quic-go"
 
@@ -101,23 +100,40 @@ func (t *quicListener) serve(ctx context.Context) error {
 	}
 	defer udpConn.Close()
 
-	quicTransport := &quic.Transport{Conn: udpConn}
-	defer quicTransport.Close()
-
-	svc := stun.New(t.cfg, t, &transportPacketConn{tran: quicTransport})
-	stunCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	go svc.Serve(stunCtx)
-
-	t.registry.Register(t.uri.Scheme, quicTransport)
-	defer t.registry.Unregister(t.uri.Scheme, quicTransport)
-
-	listener, err := quicTransport.Listen(t.tlsCfg, quicConfig)
+	// A single demux owns reads from udpConn. quic-go documents that a
+	// PacketConn may only be passed to one Transport, so standard and masked
+	// QUIC each get a logical PacketConn and Transport below.
+	demux := newQUICPacketDemux(udpConn)
+	plainTransport := &quic.Transport{Conn: demux.plain}
+	wechatTransport := &quic.Transport{Conn: demux.wechat}
+	plainListener, err := plainTransport.Listen(t.tlsCfg, quicConfigForMode(false))
 	if err != nil {
+		_ = demux.Close()
 		slog.WarnContext(ctx, "Failed to listen (QUIC)", slogutil.Error(err))
 		return err
 	}
-	defer listener.Close()
+	wechatListener, err := wechatTransport.Listen(t.tlsCfg, quicConfigForMode(true))
+	if err != nil {
+		_ = plainListener.Close()
+		_ = plainTransport.Close()
+		_ = demux.Close()
+		slog.WarnContext(ctx, "Failed to listen (QUIC with WeChat masking)", slogutil.Error(err))
+		return err
+	}
+
+	stunCtx, cancelSTUN := context.WithCancel(ctx)
+	stunDone := make(chan struct{})
+	go func() {
+		defer close(stunDone)
+		_ = stun.New(t.cfg, t, demux.stun).Serve(stunCtx)
+	}()
+
+	plainRegistration := &quicTransportRegistration{transport: plainTransport}
+	wechatRegistration := &quicTransportRegistration{transport: wechatTransport, wechatMasking: true}
+	t.registry.Register(t.uri.Scheme, plainRegistration)
+	defer t.registry.Unregister(t.uri.Scheme, plainRegistration)
+	t.registry.Register(t.uri.Scheme, wechatRegistration)
+	defer t.registry.Unregister(t.uri.Scheme, wechatRegistration)
 
 	t.notifyAddressesChanged(t)
 	defer t.clearAddresses(t)
@@ -151,38 +167,47 @@ func (t *quicListener) serve(ctx context.Context) error {
 		t.mut.Unlock()
 	}()
 
-	acceptFailures := 0
-	const maxAcceptFailures = 10
+	acceptCtx, stopAccept := context.WithCancel(ctx)
+	acceptResults := make(chan quicAcceptResult, 2)
+	var acceptWG sync.WaitGroup
+	acceptWG.Add(2)
+	go func() {
+		defer acceptWG.Done()
+		acceptQUICSessions(acceptCtx, plainListener, false, acceptResults)
+	}()
+	go func() {
+		defer acceptWG.Done()
+		acceptQUICSessions(acceptCtx, wechatListener, true, acceptResults)
+	}()
+	defer func() {
+		stopAccept()
+		cancelSTUN()
+		_ = plainListener.Close()
+		_ = wechatListener.Close()
+		_ = plainTransport.Close()
+		_ = wechatTransport.Close()
+		_ = demux.Close()
+		acceptWG.Wait()
+		<-stunDone
+	}()
 
 	for {
+		var result quicAcceptResult
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		session, err := listener.Accept(ctx)
-		if errors.Is(err, context.Canceled) {
 			return nil
-		} else if err != nil {
-			slog.WarnContext(ctx, "Failed to accept QUIC connection", slogutil.Error(err))
-
-			acceptFailures++
-			if acceptFailures > maxAcceptFailures {
-				// Return to restart the listener, because something
-				// seems permanently damaged.
-				return err
+		case result = <-acceptResults:
+		}
+		if result.err != nil {
+			if errors.Is(result.err, context.Canceled) && ctx.Err() != nil {
+				return nil
 			}
-
-			// Slightly increased delay for each failure.
-			time.Sleep(time.Duration(acceptFailures) * time.Second)
-
-			continue
+			slog.WarnContext(ctx, "Failed to accept QUIC connection", slogutil.Error(result.err))
+			return result.err
 		}
 
-		acceptFailures = 0
-
-		slog.DebugContext(ctx, "Incoming connection", "from", session.RemoteAddr())
+		session := result.session
+		slog.DebugContext(ctx, "Incoming connection", "from", session.RemoteAddr(), "type", connTypeForQUIC(result.wechatMasking, false).String())
 
 		streamCtx, cancel := context.WithTimeout(ctx, quicOperationTimeout)
 		stream, err := session.AcceptStream(streamCtx)
@@ -198,7 +223,55 @@ func (t *quicListener) serve(ctx context.Context) error {
 		if isLocal {
 			priority = t.cfg.Options().ConnectionPriorityQUICLAN
 		}
-		t.conns <- newInternalConn(&quicTlsConn{session, stream, nil}, connTypeQUICServer, isLocal, priority)
+		connType := connTypeForQUIC(result.wechatMasking, false)
+		conn := newInternalConn(&quicTlsConn{session, stream, nil}, connType, isLocal, priority)
+		select {
+		case t.conns <- conn:
+		case <-ctx.Done():
+			_ = conn.Close()
+			return nil
+		}
+	}
+}
+
+type quicAcceptResult struct {
+	session       *quic.Conn
+	wechatMasking bool
+	err           error
+}
+
+func acceptQUICSessions(ctx context.Context, listener *quic.Listener, wechatMasking bool, results chan<- quicAcceptResult) {
+	for {
+		session, err := listener.Accept(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			select {
+			case results <- quicAcceptResult{err: err}:
+			case <-ctx.Done():
+			}
+			return
+		}
+		select {
+		case results <- quicAcceptResult{session: session, wechatMasking: wechatMasking}:
+		case <-ctx.Done():
+			_ = session.CloseWithError(0, "listener shutting down")
+			return
+		}
+	}
+}
+
+func connTypeForQUIC(wechatMasking, client bool) connType {
+	switch {
+	case wechatMasking && client:
+		return connTypeQUICWechatClient
+	case wechatMasking:
+		return connTypeQUICWechatServer
+	case client:
+		return connTypeQUICClient
+	default:
+		return connTypeQUICServer
 	}
 }
 

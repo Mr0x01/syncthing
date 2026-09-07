@@ -1488,6 +1488,7 @@ angular.module('syncthing.core')
             if (!conn) return "-1";
             var type = "disconnected";
             if (conn.type.indexOf('relay') === 0) type = "relay";
+            else if (conn.type.indexOf('quic-wechat') === 0) type = "quicwechat";
             else if (conn.type.indexOf('quic') === 0) type = "quic";
             else if (conn.type.indexOf('tcp') === 0) type = "tcp";
             else return type;
@@ -1507,6 +1508,10 @@ angular.module('syncthing.core')
                     return $translate.instant('QUIC WAN');
                 case "quiclan":
                     return $translate.instant('QUIC LAN');
+                case "quicwechatwan":
+                    return $translate.instant('QUIC WeChat masked WAN');
+                case "quicwechatlan":
+                    return $translate.instant('QUIC WeChat masked LAN');
                 case "tcpwan":
                     return $translate.instant('TCP WAN');
                 case "tcplan":
@@ -1521,8 +1526,11 @@ angular.module('syncthing.core')
             case "tcplan":
             case "quiclan":
                 return "reception-4";
+            case "quicwechatlan":
+                return "reception-4";
             case "tcpwan":
             case "quicwan":
+            case "quicwechatwan":
                 return "reception-3";
             case "relaylan":
                 return "reception-2";
@@ -1542,6 +1550,10 @@ angular.module('syncthing.core')
                     return $translate.instant('Using a QUIC connection over LAN');
                 case "quicwan":
                     return $translate.instant('Using a QUIC connection over WAN');
+                case "quicwechatlan":
+                    return $translate.instant('Using a QUIC connection with WeChat video masking over LAN');
+                case "quicwechatwan":
+                    return $translate.instant('Using a QUIC connection with WeChat video masking over WAN');
                 case "tcpwan":
                     return $translate.instant('Using a direct TCP connection over WAN');
                 case "tcplan":

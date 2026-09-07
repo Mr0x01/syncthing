@@ -56,6 +56,8 @@ const (
 	connTypeTCPServer
 	connTypeQUICClient
 	connTypeQUICServer
+	connTypeQUICWechatClient
+	connTypeQUICWechatServer
 )
 
 func (t connType) String() string {
@@ -72,6 +74,10 @@ func (t connType) String() string {
 		return "quic-client"
 	case connTypeQUICServer:
 		return "quic-server"
+	case connTypeQUICWechatClient:
+		return "quic-wechat-client"
+	case connTypeQUICWechatServer:
+		return "quic-wechat-server"
 	default:
 		return "unknown-type"
 	}
@@ -83,11 +89,24 @@ func (t connType) Transport() string {
 		return "relay"
 	case connTypeTCPClient, connTypeTCPServer:
 		return "tcp"
-	case connTypeQUICClient, connTypeQUICServer:
+	case connTypeQUICClient, connTypeQUICServer, connTypeQUICWechatClient, connTypeQUICWechatServer:
 		return "quic"
 	default:
 		return "unknown"
 	}
+}
+
+func (c internalConn) isQUIC() bool {
+	switch c.connType {
+	case connTypeQUICClient, connTypeQUICServer, connTypeQUICWechatClient, connTypeQUICWechatServer:
+		return true
+	default:
+		return false
+	}
+}
+
+func (c internalConn) isQUICWechat() bool {
+	return c.connType == connTypeQUICWechatClient || c.connType == connTypeQUICWechatServer
 }
 
 func newInternalConn(tc tlsConn, connType connType, isLocal bool, priority int) internalConn {

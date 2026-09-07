@@ -70,6 +70,8 @@ var (
 	errDeviceIgnored          = errors.New("device is ignored")
 	errConnLimitReached       = errors.New("connection limit reached")
 	errDevicePaused           = errors.New("device is paused")
+	errQUICModeMismatch       = errors.New("QUIC masking mode does not match device configuration")
+	errQUICModeChanged        = errors.New("QUIC masking mode changed")
 
 	// A connection is being closed to make space for better ones
 	errReplacingConnection = errors.New("replacing connection")
@@ -285,6 +287,17 @@ func (s *service) handleConns(ctx context.Context) error {
 			continue
 		}
 
+		// The packet mode is known before the peer's BEP hello and device
+		// configuration are available. Once the TLS certificate-derived ID is
+		// available, check the mode before handing the hello to the model.
+		if c.isQUIC() {
+			if deviceCfg, ok := s.cfg.Device(remoteID); ok && c.isQUICWechat() != deviceCfg.QUICWechatVideoMasking {
+				slog.DebugContext(ctx, "Rejecting QUIC connection with mismatched masking mode", remoteID.LogAttr(), slogutil.Address(c.RemoteAddr()), slog.String("type", c.Type()))
+				c.Close()
+				continue
+			}
+		}
+
 		_ = c.SetDeadline(time.Now().Add(20 * time.Second))
 		go func() {
 			// Exchange Hello messages with the peer.
@@ -397,6 +410,12 @@ func (s *service) handleHellos(ctx context.Context) error {
 		deviceCfg, ok := s.cfg.Device(remoteID)
 		if !ok {
 			slog.WarnContext(ctx, "Device removed from config during connection attempt", remoteID.LogAttr(), slogutil.Address(c.RemoteAddr()))
+			c.Close()
+			continue
+		}
+
+		if c.isQUIC() && c.isQUICWechat() != deviceCfg.QUICWechatVideoMasking {
+			slog.WarnContext(ctx, "Connection rejected: QUIC masking mode does not match device configuration", remoteID.LogAttr(), slogutil.Address(c.RemoteAddr()), slog.String("type", c.Type()))
 			c.Close()
 			continue
 		}
@@ -680,6 +699,9 @@ func (s *service) resolveDialTargets(ctx context.Context, now time.Time, cfg con
 		}
 
 		dialer := dialerFactory.New(s.cfg.Options(), s.tlsCfg, s.registry, s.lanChecker)
+		if configDialer, ok := dialer.(interface{ setConfig(config.Wrapper) }); ok {
+			configDialer.setConfig(s.cfg)
+		}
 		priority := dialer.Priority(uri.Host)
 		currentConns := s.numConnectionsForDevice(deviceCfg.DeviceID)
 		if priority > priorityCutoff {
@@ -914,7 +936,10 @@ func (s *service) checkAndSignalConnectLoopOnUpdatedDevices(from, to config.Conf
 		if oldDev, ok := oldDevices[dev.DeviceID]; !ok || oldDev.Paused {
 			s.dialNowDevices[dev.DeviceID] = struct{}{}
 			dial = true
-		} else if !slices.Equal(oldDev.Addresses, dev.Addresses) {
+		} else if !slices.Equal(oldDev.Addresses, dev.Addresses) || oldDev.QUICWechatVideoMasking != dev.QUICWechatVideoMasking {
+			if oldDev.QUICWechatVideoMasking != dev.QUICWechatVideoMasking {
+				s.closeQUICConnectionsForDevice(dev.DeviceID, errQUICModeChanged)
+			}
 			dial = true
 		}
 	}
@@ -1194,6 +1219,13 @@ func (s *service) validateIdentity(c internalConn, expectedID protocol.DeviceID)
 		return fmt.Errorf("unexpected device id, expected %s got %s", expectedID, remoteID)
 	}
 
+	if c.isQUIC() {
+		if deviceCfg, ok := s.cfg.Device(expectedID); ok && c.isQUICWechat() != deviceCfg.QUICWechatVideoMasking {
+			c.Close()
+			return fmt.Errorf("%w: expected masking=%t, connection masking=%t", errQUICModeMismatch, deviceCfg.QUICWechatVideoMasking, c.isQUICWechat())
+		}
+	}
+
 	return nil
 }
 
@@ -1324,6 +1356,19 @@ type deviceConnectionTracker struct {
 	connectionsMut  sync.Mutex
 	connections     map[protocol.DeviceID][]protocol.Connection // current connections
 	wantConnections map[protocol.DeviceID]int                   // number of connections they want
+}
+
+func (c *deviceConnectionTracker) closeQUICConnectionsForDevice(device protocol.DeviceID, err error) {
+	c.connectionsMut.Lock()
+	connections := append([]protocol.Connection(nil), c.connections[device]...)
+	c.connectionsMut.Unlock()
+
+	for _, conn := range connections {
+		if !strings.HasPrefix(conn.Transport(), "quic") {
+			continue
+		}
+		go conn.Close(err)
+	}
 }
 
 func (c *deviceConnectionTracker) accountAddedConnection(conn protocol.Connection, h protocol.Hello, upgradeThreshold int) {

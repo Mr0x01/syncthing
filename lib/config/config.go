@@ -220,6 +220,9 @@ func ReadJSON(r io.Reader, myID protocol.DeviceID) (Configuration, error) {
 	cfg.Devices = make([]DeviceConfiguration, len(rawFoldersDevices.Devices))
 	for i, bs := range rawFoldersDevices.Devices {
 		cfg.Devices[i] = cfg.Defaults.Device.Copy()
+		// Device-only fields must not be inherited from the defaults object
+		// when JSON decoding starts each device from a copied default.
+		ensureZeroForNodefault(&DeviceConfiguration{}, &cfg.Devices[i])
 		if err := json.Unmarshal(bs, &cfg.Devices[i]); err != nil {
 			return Configuration{}, err
 		}

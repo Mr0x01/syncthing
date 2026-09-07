@@ -402,6 +402,10 @@ func TestConnectionEstablishment(t *testing.T) {
 }
 
 func withConnectionPair(b interface{ Fatal(...any) }, connUri string, h func(client, server internalConn)) {
+	withConnectionPairMode(b, connUri, false, h)
+}
+
+func withConnectionPairMode(b interface{ Fatal(...any) }, connUri string, wechatMasking bool, h func(client, server internalConn)) {
 	// Root of the service tree.
 	supervisor := suture.New("main", suture.Spec{
 		PassThroughPanics: true,
@@ -424,6 +428,10 @@ func withConnectionPair(b interface{ Fatal(...any) }, connUri string, h func(cli
 		Options: config.OptionsConfiguration{
 			RelaysEnabled: true,
 		},
+		Devices: []config.DeviceConfiguration{{
+			DeviceID:               deviceId,
+			QUICWechatVideoMasking: wechatMasking,
+		}},
 	}
 	wcfg := config.Wrap("", cfg, deviceId, events.NoopLogger)
 	uri, err := url.Parse(connUri)
@@ -458,6 +466,9 @@ func withConnectionPair(b interface{ Fatal(...any) }, connUri string, h func(cli
 	}
 	// Purposely using a different registry: Don't want to reuse port between dialer and listener on the same device
 	dialer := df.New(cfg.Options, tlsCfg, registry.New(), lanChecker)
+	if configDialer, ok := dialer.(interface{ setConfig(config.Wrapper) }); ok {
+		configDialer.setConfig(wcfg)
+	}
 
 	// Relays might take some time to register the device, so dial multiple times
 	clientConn, err := dialer.Dial(ctx, deviceId, addr)

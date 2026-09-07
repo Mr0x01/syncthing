@@ -40,10 +40,17 @@ type quicDialer struct {
 	commonDialer
 
 	registry *registry.Registry
+	cfg      config.Wrapper
 }
 
-func (d *quicDialer) Dial(ctx context.Context, _ protocol.DeviceID, uri *url.URL) (internalConn, error) {
+func (d *quicDialer) Dial(ctx context.Context, deviceID protocol.DeviceID, uri *url.URL) (internalConn, error) {
 	uri = fixupPort(uri, config.DefaultQUICPort)
+	wechatMasking := false
+	if d.cfg != nil {
+		if deviceCfg, ok := d.cfg.Device(deviceID); ok {
+			wechatMasking = deviceCfg.QUICWechatVideoMasking
+		}
+	}
 
 	network := quicNetwork(uri)
 
@@ -55,20 +62,31 @@ func (d *quicDialer) Dial(ctx context.Context, _ protocol.DeviceID, uri *url.URL
 	// If we created the conn we need to close it at the end. If we got a
 	// Transport from the registry we have no conn to close.
 	var createdConn net.PacketConn
-	transport, _ := d.registry.Get(uri.Scheme, transportConnUnspecified).(*quic.Transport)
+	registration, _ := d.registry.Get(uri.Scheme, func(item any) bool {
+		candidate, ok := item.(*quicTransportRegistration)
+		return ok && candidate.wechatMasking == wechatMasking && transportConnUnspecified(candidate.transport)
+	}).(*quicTransportRegistration)
+	var transport *quic.Transport
+	if registration != nil {
+		transport = registration.transport
+	}
 	if transport == nil {
 		if packetConn, err := net.ListenPacket("udp", ":0"); err != nil {
 			return internalConn{}, err
 		} else {
 			createdConn = packetConn
-			transport = &quic.Transport{Conn: packetConn}
+			if wechatMasking {
+				transport = &quic.Transport{Conn: newWechatPacketConn(packetConn)}
+			} else {
+				transport = &quic.Transport{Conn: packetConn}
+			}
 		}
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, quicOperationTimeout)
 	defer cancel()
 
-	session, err := transport.Dial(ctx, addr, d.tlsCfg, quicConfig)
+	session, err := transport.Dial(ctx, addr, d.tlsCfg, quicConfigForMode(wechatMasking))
 	if err != nil {
 		if createdConn != nil {
 			_ = createdConn.Close()
@@ -92,7 +110,18 @@ func (d *quicDialer) Dial(ctx context.Context, _ protocol.DeviceID, uri *url.URL
 		priority = d.lanPriority
 	}
 
-	return newInternalConn(&quicTlsConn{session, stream, createdConn}, connTypeQUICClient, isLocal, priority), nil
+	connType := connTypeQUICClient
+	if wechatMasking {
+		connType = connTypeQUICWechatClient
+	}
+	return newInternalConn(&quicTlsConn{session, stream, createdConn}, connType, isLocal, priority), nil
+}
+
+// setConfig is called by the connection service for each dialer instance. The
+// dial target already contains the remote DeviceID, so this lookup remains
+// per-device and never changes a shared transport setting.
+func (d *quicDialer) setConfig(cfg config.Wrapper) {
+	d.cfg = cfg
 }
 
 type quicDialerFactory struct{}
